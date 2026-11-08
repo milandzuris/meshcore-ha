@@ -1,770 +1,817 @@
-"""Dynamic telemetry sensor platform for MeshCore integration."""
+"""Utility functions for the MeshCore integration."""
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
-import time
-from collections.abc import Callable
-from datetime import datetime
-from functools import partial
+import math
+import re
+import sys
+from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 
-from homeassistant.components.sensor import (
-    SensorDeviceClass,
-    SensorEntity,
-    SensorEntityDescription,
-    SensorStateClass,
-)
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from Crypto.Cipher import AES
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
+from homeassistant.util import slugify
 
-from custom_components.meshcore import MeshCoreDataUpdateCoordinator
-from meshcore import EventType
-from meshcore.events import Event
-from meshcore.lpp_json_encoder import my_lpp_types
-
-from .const import (
-    DOMAIN,
-    SENSOR_AVAILABILITY_TIMEOUT_MULTIPLIER,
-)
-from .utils import (
-    build_device_id,
-    build_device_name,
-    calculate_battery_percentage,
-    extract_pubkey_hex,
-    format_entity_id,
-    get_device_model,
-    sanitize_name,
-    telemetry_pubkey_prefix,
-    via_companion,
-)
+from .const import BAT_VMAX, BAT_VMIN, CHANNEL_PREFIX, DOMAIN, MESSAGES_SUFFIX, NodeType
 
 _LOGGER = logging.getLogger(__name__)
 
-# Home Assistant presentation for the Cayenne LPP types the library decodes.
-# Display names, value shapes and multi-value field names come from the
-# library's own table, so a decoder that learns a new type cannot leave it
-# without a sensor; only units, device classes, icons and precision live here.
-# GPS (136) is absent on purpose: the device_tracker platform owns it.
-_LPP_PRESENTATION: dict[int, dict[str, Any]] = {
-    0: {"name": "Digital Input", "icon": "mdi:toggle-switch"},
-    1: {"name": "Digital Output", "icon": "mdi:toggle-switch"},
-    2: {
-        "name": "Analog Input",
-        "icon": "mdi:sine-wave",
-        "state_class": SensorStateClass.MEASUREMENT,
-        "native_unit_of_measurement": "V",
-        "suggested_display_precision": 2,
-    },
-    3: {
-        "name": "Analog Output",
-        "icon": "mdi:sine-wave",
-        "state_class": SensorStateClass.MEASUREMENT,
-        "native_unit_of_measurement": "V",
-        "suggested_display_precision": 2,
-    },
-    100: {
-        "name": "Generic Sensor",
-        "icon": "mdi:gauge",
-        "state_class": SensorStateClass.MEASUREMENT,
-    },
-    101: {
-        "name": "Illuminance",
-        "icon": "mdi:brightness-6",
-        "device_class": SensorDeviceClass.ILLUMINANCE,
-        "native_unit_of_measurement": "lx",
-        "state_class": SensorStateClass.MEASUREMENT,
-    },
-    102: {"name": "Presence", "icon": "mdi:motion-sensor"},
-    103: {
-        "name": "Temperature",
-        "icon": "mdi:thermometer",
-        "device_class": SensorDeviceClass.TEMPERATURE,
-        "native_unit_of_measurement": "°C",
-        "state_class": SensorStateClass.MEASUREMENT,
-        "suggested_display_precision": 1,
-    },
-    104: {
-        "name": "Humidity",
-        "icon": "mdi:water-percent",
-        "device_class": SensorDeviceClass.HUMIDITY,
-        "native_unit_of_measurement": "%",
-        "state_class": SensorStateClass.MEASUREMENT,
-        "suggested_display_precision": 1,
-    },
-    113: {
-        "name": "Accelerometer",
-        "icon": "mdi:axis-arrow",
-        "state_class": SensorStateClass.MEASUREMENT,
-        "native_unit_of_measurement": "G",
-        "suggested_display_precision": 3,
-    },
-    115: {
-        "name": "Barometer",
-        "icon": "mdi:gauge",
-        "device_class": SensorDeviceClass.ATMOSPHERIC_PRESSURE,
-        "native_unit_of_measurement": "hPa",
-        "state_class": SensorStateClass.MEASUREMENT,
-        "suggested_display_precision": 1,
-    },
-    116: {
-        "name": "Voltage",
-        "icon": "mdi:flash",
-        "device_class": SensorDeviceClass.VOLTAGE,
-        "native_unit_of_measurement": "V",
-        "state_class": SensorStateClass.MEASUREMENT,
-        "suggested_display_precision": 2,
-    },
-    117: {
-        "name": "Current",
-        "icon": "mdi:current-dc",
-        "device_class": SensorDeviceClass.CURRENT,
-        "native_unit_of_measurement": "A",
-        "suggested_unit_of_measurement": "mA",
-        "state_class": SensorStateClass.MEASUREMENT,
-        "suggested_display_precision": 1,
-    },
-    118: {
-        "name": "Frequency",
-        "icon": "mdi:sine-wave",
-        "device_class": SensorDeviceClass.FREQUENCY,
-        "native_unit_of_measurement": "Hz",
-        "state_class": SensorStateClass.MEASUREMENT,
-        "suggested_display_precision": 0,
-    },
-    120: {
-        "name": "Percentage",
-        "icon": "mdi:percent",
-        "native_unit_of_measurement": "%",
-        "state_class": SensorStateClass.MEASUREMENT,
-        "suggested_display_precision": 0,
-    },
-    121: {
-        "name": "Altitude",
-        "icon": "mdi:altimeter",
-        "device_class": SensorDeviceClass.DISTANCE,
-        "native_unit_of_measurement": "m",
-        "state_class": SensorStateClass.MEASUREMENT,
-        "suggested_display_precision": 1,
-    },
-    122: {
-        "name": "Load",
-        "icon": "mdi:weight",
-        "device_class": SensorDeviceClass.WEIGHT,
-        "native_unit_of_measurement": "kg",
-        "state_class": SensorStateClass.MEASUREMENT,
-        "suggested_display_precision": 3,
-    },
-    125: {
-        "name": "Concentration",
-        "icon": "mdi:molecule",
-        "native_unit_of_measurement": "ppm",
-        "state_class": SensorStateClass.MEASUREMENT,
-        "suggested_display_precision": 0,
-    },
-    128: {
-        "name": "Power",
-        "icon": "mdi:flash",
-        "device_class": SensorDeviceClass.POWER,
-        "native_unit_of_measurement": "W",
-        "state_class": SensorStateClass.MEASUREMENT,
-        "suggested_display_precision": 0,
-    },
-    130: {
-        "name": "Distance",
-        "icon": "mdi:ruler",
-        "device_class": SensorDeviceClass.DISTANCE,
-        "native_unit_of_measurement": "m",
-        "state_class": SensorStateClass.MEASUREMENT,
-        "suggested_display_precision": 3,
-    },
-    131: {
-        "name": "Energy",
-        "icon": "mdi:lightning-bolt",
-        "device_class": SensorDeviceClass.ENERGY,
-        "native_unit_of_measurement": "kWh",
-        "state_class": SensorStateClass.TOTAL_INCREASING,
-        "suggested_display_precision": 3,
-    },
-    132: {
-        "name": "Direction",
-        "icon": "mdi:compass",
-        "native_unit_of_measurement": "°",
-        "state_class": SensorStateClass.MEASUREMENT,
-        "suggested_display_precision": 0,
-    },
-    133: {"name": "Time", "icon": "mdi:clock"},
-    134: {
-        "name": "Gyrometer",
-        "icon": "mdi:axis-z-rotate-clockwise",
-        "native_unit_of_measurement": "°/s",
-        "state_class": SensorStateClass.MEASUREMENT,
-        "suggested_display_precision": 2,
-    },
-    135: {
-        "name": "Color",
-        "icon": "mdi:palette",
-        "state_class": SensorStateClass.MEASUREMENT,
-    },
-    142: {"name": "Switch", "icon": "mdi:toggle-switch"},
-}
 
-# LPP type the device_tracker platform owns; never given a sensor here.
-GPS_LPP_TYPE: Final = 136
+def extract_pubkey_from_selection(selection: str) -> str | None:
+    """Extract pubkey from selection format 'Name (pubkey)'.
 
-# Axes for the multi-value types the library decodes without naming their
-# fields: those readings arrive as a bare list, so the axes are positional.
-_POSITIONAL_AXES: dict[int, list[str]] = {134: ["x", "y", "z"]}
-
-
-def _build_lpp_mappings() -> dict[int | str, dict]:
-    """Derive the sensor table from the library's LPP type table.
-
-    Every decoded type gets an entry under both its numeric code and the
-    string name the encoder puts in the payload. Multi-value types get one
-    sensor per field, keyed by the library's own field name where it names
-    them and by position where it does not.
+    Handles names with parentheses by extracting only the last parentheses.
+    Example: 'Queen Anne (Soon) (abc123)' returns 'abc123'
     """
-    mappings: dict[int | str, dict] = {}
-    for code, (library_name, fields) in my_lpp_types.items():
-        if code == GPS_LPP_TYPE:
-            continue
-        presentation = dict(_LPP_PRESENTATION.get(code, {}))
-        config: dict[str, Any] = {
-            "name": presentation.pop("name", library_name.title()),
-            "icon": presentation.pop("icon", "mdi:gauge"),
-            **presentation,
-        }
-        axes = fields if fields else _POSITIONAL_AXES.get(code)
-        config["create_multi"] = bool(axes)
-        if axes:
-            config["multi_fields"] = [
-                {
-                    "field": field,
-                    "index": index,
-                    "name": f"{config['name']} {field.rsplit('_', 1)[-1].upper()}",
-                }
-                for index, field in enumerate(axes)
-            ]
-        mappings[code] = config
-        mappings[library_name] = config
-    return mappings
+    match = re.search(r'\(([^)]+)\)$', selection)
+    return match.group(1) if match else None
 
 
-# Maps both numeric LPP codes and string type names to sensor configurations.
-LPP_TYPE_MAPPINGS: dict[int | str, dict] = _build_lpp_mappings()
+def extract_pubkey_hex(contact: dict[str, Any]) -> str:
+    """Return a contact's public key as a hex string.
 
-
-def lpp_field_value(value: Any, field: str | None, index: int | None) -> Any:
-    """Pick one sensor's reading out of an LPP value.
-
-    Named multi-value readings arrive as a dict keyed by the library's field
-    names; unnamed ones arrive as a bare list, including the single-element
-    list a one-dimensional unnamed type produces, which Home Assistant would
-    otherwise reject as a list-valued state.
+    Coordinator contacts carry ``public_key`` as a plain hex string. Older
+    code paths represented it as a ``{"hex": ...}`` dict; handle both so a
+    string-shaped key never raises ``AttributeError`` when callers expect a
+    string (e.g. ``.startswith(...)`` in the node-info lookup loops).
     """
-    if isinstance(value, dict):
-        return value.get(field) if field else value
-    if isinstance(value, (list, tuple)):
-        if index is not None:
-            return value[index] if index < len(value) else None
-        return value[0] if len(value) == 1 else value
-    return value
+    pk = contact.get("public_key", "")
+    if isinstance(pk, dict):
+        return pk.get("hex", "")
+    return pk or ""
 
 
-class TelemetrySensorManager:
-    """Manages dynamic creation and updates of telemetry sensors."""
+def telemetry_pubkey_prefix(event: Any) -> str:
+    """Return the node a TELEMETRY_RESPONSE belongs to, or "" when unstated.
 
-    def __init__(
-        self,
-        coordinator: MeshCoreDataUpdateCoordinator,
-        async_add_entities: AddEntitiesCallback,
+    A polled response carries ``pubkey_prefix`` in its payload, but a frame
+    the node pushes names the sender as ``pubkey_pre`` in the payload and
+    ``pubkey_prefix`` in the event attributes only. Reading the payload alone
+    made every push frame look like the companion's own telemetry.
+    """
+    payload = getattr(event, "payload", None)
+    attributes = getattr(event, "attributes", None)
+    for source, key in (
+        (payload, "pubkey_prefix"),
+        (attributes, "pubkey_prefix"),
+        (payload, "pubkey_pre"),
     ):
-        self.coordinator = coordinator
-        self.async_add_entities = async_add_entities
-        self.discovered_sensors = {}  # Track discovered sensors by unique key
+        if isinstance(source, dict) and source.get(key):
+            return str(source[key])
+    return ""
 
-    def setup_telemetry_listener(self) -> Callable[[], None]:
-        """Subscribe to telemetry response events; returns the remover."""
-        unsubscribe = self.coordinator.api.subscribe(
-            EventType.TELEMETRY_RESPONSE, self._handle_telemetry_event
-        )
-        _LOGGER.debug("Telemetry sensor manager initialized")
-        return unsubscribe
 
-    async def _handle_telemetry_event(self, event: Event):
-        """Handle incoming telemetry events and discover new sensors."""
-        if not event.payload or "lpp" not in event.payload:
-            _LOGGER.debug("No LPP data in telemetry event")
-            return
+def get_node_type_str(node_type: str | None) -> str:
+    """Convert NodeType to a human-readable string."""
+    if node_type == NodeType.CLIENT:
+        return "Client"
+    elif node_type == NodeType.REPEATER:
+        return "Repeater"
+    elif node_type == NodeType.ROOM_SERVER:
+        return "Room Server"
+    elif node_type == NodeType.SENSOR:
+        return "Sensor"
+    else:
+        return "Unknown"
 
-        pubkey_prefix = telemetry_pubkey_prefix(event)
-        lpp_data = event.payload.get("lpp", [])
 
-        # If no pubkey_prefix, this might be self telemetry
-        if not pubkey_prefix:
-            # Check if this is a self telemetry response (no pubkey_pre field)
-            # Use the coordinator's own pubkey for self telemetry
-            if "lpp" in event.payload and self.coordinator.pubkey:
-                pubkey_prefix = self.coordinator.pubkey[
-                    :12
-                ]  # Use first 12 chars as prefix
-                _LOGGER.debug(
-                    f"Self telemetry detected, using coordinator pubkey: {pubkey_prefix}"
-                )
-            else:
-                _LOGGER.warning(
-                    "Telemetry event missing pubkey_prefix and not self telemetry"
-                )
-                return
+def sanitize_name(name: str) -> str:
+    """Convert a name to a format safe for entity IDs.
 
-        # Find the node info for smart naming
-        node_info = self._get_node_info(pubkey_prefix)
+    Converts to lowercase, replaces spaces with underscores,
+    optionally replaces hyphens with underscores, and removes double underscores.
+    """
+    return slugify(name.lower() if name else "")
 
-        # Process each channel in the LPP data
-        new_sensors = []
-        for channel_data in lpp_data:
-            channel = channel_data.get("channel")
-            lpp_type = channel_data.get("type")
-            value = channel_data.get("value")
 
-            if channel is None or lpp_type is None:
+
+def format_entity_id(
+    domain: str, device_name: str, entity_key: str, suffix: str = ""
+) -> str:
+    """Format a consistent entity ID.
+
+    Args:
+        domain: Entity domain (e.g., 'binary_sensor', 'sensor')
+        device_name: Device name (already sanitized)
+        entity_key: Entity-specific identifier
+        suffix: Optional suffix for the entity ID
+
+    Returns:
+        Formatted entity ID with proper format: domain.name_parts
+    """
+    if not domain or not entity_key:
+        _LOGGER.warning("Missing required parameters for entity ID formatting")
+        return ""
+
+    # Build the entity name parts (everything after the domain)
+    # Filter out empty strings to prevent double underscores
+    name_parts = [part for part in [DOMAIN, device_name, entity_key, suffix] if part]
+
+    # Join parts with underscores and clean up any double underscores
+    entity_name = "_".join(name_parts).replace("__", "_")
+
+    # Format as domain.entity_name
+    return f"{domain}.{sanitize_name(entity_name)}"
+
+
+def find_device(hass: HomeAssistant, entry_id: str, identifier: str) -> dr.DeviceEntry | None:
+    """Return this entry's device with the given identifier.
+
+    Newer Home Assistant keys identifiers per config entry and deprecates the
+    lookup that ignores the entry; older releases only have that lookup.
+    """
+    registry = dr.async_get(hass)
+    lookup = getattr(registry, "async_get_device_by_identifier", None)
+    if lookup is not None:
+        return lookup((DOMAIN, identifier), entry_id)
+    return registry.async_get_device(identifiers={(DOMAIN, identifier)})
+
+
+def via_companion(hass: HomeAssistant, entry_id: str) -> dict[str, Any]:
+    """Return the DeviceInfo field that links a node's device to its companion.
+
+    Newer Home Assistant takes the companion's registry id (via_device_id);
+    older releases only know the identifier pair (via_device).
+    """
+    if "via_device_id" not in getattr(dr.DeviceInfo, "__annotations__", {}):
+        return {"via_device": (DOMAIN, entry_id)}
+    device = find_device(hass, entry_id, entry_id)
+    return {"via_device_id": device.id} if device is not None else {}
+
+
+# The firmware's MAX_TEXT_LEN (BaseChatMesh.h): the plaintext budget for both
+# message kinds. A channel message spends part of it on the "<node name>: "
+# prefix and is cut without an error past the cap
+# (BaseChatMesh::sendGroupMessage); a direct message carries no prefix and is
+# refused outright instead (BaseChatMesh::composeMsgPacket returns NULL).
+TEXT_MAX_BYTES: Final = 160
+
+
+def channel_text_budget(node_name: str) -> int:
+    """Return the UTF-8 bytes of channel text the companion sends uncut."""
+    return TEXT_MAX_BYTES - len(f"{node_name}: ".encode())
+
+
+def direct_text_budget() -> int:
+    """Return the UTF-8 bytes of direct-message text the companion accepts."""
+    return TEXT_MAX_BYTES
+
+
+def truncate_to_bytes(text: str, limit: int) -> str:
+    """Cut text to at most ``limit`` UTF-8 bytes, never splitting a character.
+
+    Decoding the slice with ``ignore`` drops a multi-byte character the cut
+    landed inside, so the result is always shorter than the limit rather than
+    invalid UTF-8 the firmware would reject.
+    """
+    encoded = text.encode()
+    if len(encoded) <= limit:
+        return text
+    return encoded[:limit].decode("utf-8", "ignore")
+
+
+def get_channel_entity_id(
+    domain: str, device_name: str, channel_idx: int, suffix: str = MESSAGES_SUFFIX
+) -> str:
+    """Create a consistent entity ID for channel entities."""
+    safe_channel = f"{CHANNEL_PREFIX}{channel_idx}"
+    return format_entity_id(domain, device_name, safe_channel, suffix)
+
+
+def get_contact_entity_id(
+    domain: str, device_name: str, pubkey: str, suffix: str = MESSAGES_SUFFIX
+) -> str:
+    """Create a consistent entity ID for contact entities."""
+    return format_entity_id(domain, device_name, pubkey, suffix)
+
+
+def extract_channel_idx(entity_key: str) -> int:
+    """Extract channel index from an entity key."""
+    try:
+        if entity_key and entity_key.startswith(CHANNEL_PREFIX):
+            channel_idx_str = entity_key.replace(CHANNEL_PREFIX, "")
+            return int(channel_idx_str)
+    except (ValueError, TypeError):
+        _LOGGER.warning(f"Could not extract channel index from {entity_key}")
+
+    return 0  # Default to channel 0 on error
+
+
+def calculate_battery_percentage(voltage_mv: float) -> float:
+    """Calculate battery percentage using generic battery discharge curve.
+
+    Args:
+        voltage_mv: Battery voltage in millivolts
+
+    Returns:
+        Battery percentage (0-100)
+    """
+    battery_percentage = (voltage_mv - BAT_VMIN) / (BAT_VMAX - BAT_VMIN) * 100
+    return round(max(0, min(100, battery_percentage)), 2)
+
+# How far a freshly computed boot time may drift from the previous one before
+# it is treated as a real change (i.e. a reboot). Uptime arrives over LoRa, so
+# the moment we receive it lags the moment the node sampled it by a few
+# seconds, and the node's clock drifts a little against ours. Without this
+# tolerance the boot timestamp would jitter on every poll and the recorder
+# would log a new state each time.
+UPTIME_DEVIATION_SECS: Final = 60
+
+
+def boot_time_from_uptime(
+    uptime_secs: float,
+    last_boot_time: datetime | None,
+    now: datetime | None = None,
+) -> datetime:
+    """Turn an uptime in seconds into the node's (UTC) boot time.
+
+    Keeps ``last_boot_time`` while the new estimate is within
+    ``UPTIME_DEVIATION_SECS`` of it, so the state only changes when the node
+    really restarted. This mirrors how Home Assistant core integrations
+    (e.g. Shelly) expose uptime as a ``timestamp`` sensor.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+    boot_time = (now - timedelta(seconds=uptime_secs)).replace(microsecond=0)
+    if (
+        last_boot_time is not None
+        and abs((boot_time - last_boot_time).total_seconds()) <= UPTIME_DEVIATION_SECS
+    ):
+        return last_boot_time
+    return boot_time
+
+
+def build_device_name(name: str, pubkey_prefix: str, node_type: str = "unknown") -> str:
+    """Build consistent device name based on node info.
+
+    Args:
+        name: Node name
+        pubkey_prefix: Public key prefix (at least 6 chars)
+        node_type: Type of node ("root", "repeater", "client", "contact", "unknown")
+
+    Returns:
+        Formatted device name
+    """
+    if not name:
+        name = f"Node {pubkey_prefix[:6]}"
+
+    pubkey_short = pubkey_prefix[:6] if pubkey_prefix else ""
+
+    if node_type == "root":
+        return f"MeshCore {name} ({pubkey_short})"
+    elif node_type == "repeater":
+        return f"MeshCore Repeater: {name} ({pubkey_short})"
+    elif node_type == "client":
+        return f"MeshCore Client: {name} ({pubkey_short})"
+    else:
+        return f"MeshCore Node: {name} ({pubkey_short})"
+
+
+def get_device_model(node_type: str) -> str:
+    """Get device model based on node type.
+
+    Args:
+        node_type: Type of node ("root", "repeater", "client", "contact", "unknown")
+
+    Returns:
+        Device model string
+    """
+    if node_type == "root":
+        return "Mesh Radio"
+    elif node_type == "repeater":
+        return "Mesh Repeater"
+    elif node_type == "client":
+        return "Mesh Client"
+    else:
+        return "Mesh Node"
+
+
+def build_device_id(
+    entry_id: str, pubkey_prefix: str, node_type: str = "unknown"
+) -> str:
+    """Build consistent device ID based on node info.
+
+    Args:
+        entry_id: Config entry ID
+        pubkey_prefix: Public key prefix
+        node_type: Type of node ("root", "repeater", "client", "contact", "unknown")
+
+    Returns:
+        Device ID string
+    """
+    if node_type == "root":
+        return entry_id
+    elif node_type in ["repeater", "client"]:
+        return f"{entry_id}_{node_type}_{pubkey_prefix}"
+    else:
+        return f"{entry_id}_{node_type}_{pubkey_prefix}"
+
+
+def decrypt_channel_message(ciphertext: bytes, cipher_mac: bytes, channel_secret: bytes) -> tuple[int | None, str | None]:
+    """Decrypt a GroupText channel message using AES-128-ECB.
+
+    Args:
+        ciphertext: Encrypted message bytes
+        cipher_mac: 2-byte HMAC-SHA256 truncated MAC
+        channel_secret: Channel secret key (16 bytes for AES-128)
+
+    Returns:
+        Tuple of (timestamp, message_text) or (None, None) on failure
+    """
+    try:
+        # Verify HMAC (optional but recommended)
+        expected_mac = hmac.new(channel_secret, ciphertext, hashlib.sha256).digest()[:2]
+        if expected_mac != cipher_mac:
+            _LOGGER.debug("HMAC verification failed for channel message")
+            # Continue anyway - some implementations may not verify
+
+        # Decrypt using AES-128 ECB
+        cipher = AES.new(channel_secret, AES.MODE_ECB)
+        decrypted = cipher.decrypt(ciphertext)
+
+        # AES plaintext: timestamp(4 bytes LE) + flags(1 byte: attempt+txt_type) + message text
+        timestamp = int.from_bytes(decrypted[0:4], byteorder="little")
+        message_text = decrypted[5:].decode("utf-8", errors="ignore").strip('\x00')
+
+        return timestamp, message_text
+
+    except Exception as ex:
+        _LOGGER.debug(f"Error decrypting channel message: {ex}")
+        return None, None
+
+
+def parse_and_decrypt_rx_log(payload: Any, channels_info: dict[int, dict]) -> dict[str, Any]:
+    """Parse RX_LOG packet and attempt to decrypt GroupText payload.
+
+    Args:
+        payload: Raw RX_LOG event payload
+        channels_info: Dict of channel_idx -> channel info (with 'channel_secret')
+
+    Returns:
+        Dict with decryption-specific fields on success (channel_idx, channel_name,
+        timestamp, text, decrypted), or parsed fields on failure (header, path_len,
+        payload_type, path, channel_hash). Empty dict if not GroupText.
+    """
+    result = {}
+
+    try:
+        if not isinstance(payload, dict):
+            return result
+
+        # Fast path: use pre-parsed fields set by the SDK's MeshcorePacketParser.
+        # These are always correct for all route types, including TC_FLOOD (route_type 0)
+        # and TC_DIRECT (route_type 3) which carry a 4-byte transport code between the
+        # header and the path_byte — a detail the raw-parsing fallback previously missed,
+        # causing region-scope (TC_FLOOD) messages to never correlate with RX_LOG data.
+        if "payload_type" in payload:
+            payload_type = payload.get("payload_type")
+            path_len = payload.get("path_len", 0)
+            path_hash_size = payload.get("path_hash_size", 1)
+            path = payload.get("path", "")
+
+            header_raw = payload.get("header")
+            if isinstance(header_raw, int):
+                result["header"] = f"{header_raw:02x}"
+            elif isinstance(header_raw, str):
+                result["header"] = header_raw
+
+            result["path_len"] = path_len
+            result["path_hash_size"] = path_hash_size
+            result["payload_type"] = payload_type
+            if path:
+                result["path"] = path
+
+            if payload_type != 5:  # 5 = GRP_TXT (GroupText channel message)
+                return result
+
+            chan_hash_hex = payload.get("chan_hash", "")
+            cipher_mac_hex = payload.get("cipher_mac", "")
+            crypted_hex = payload.get("crypted", "")
+
+            if chan_hash_hex:
+                result["channel_hash"] = chan_hash_hex
+
+            if not (chan_hash_hex and cipher_mac_hex and crypted_hex):
+                return result
+
+            try:
+                chan_hash_byte = int(chan_hash_hex, 16)
+            except ValueError:
+                return result
+
+            for channel_idx, channel_info in channels_info.items():
+                channel_secret = channel_info.get("channel_secret")
+                if not channel_secret:
+                    continue
+
+                if isinstance(channel_secret, str):
+                    channel_secret = bytes.fromhex(channel_secret)
+
+                expected_hash_byte = hashlib.sha256(channel_secret).digest()[0]
+
+                if expected_hash_byte == chan_hash_byte:
+                    try:
+                        ciphertext = bytes.fromhex(crypted_hex)
+                        cipher_mac = bytes.fromhex(cipher_mac_hex)
+                    except ValueError:
+                        continue
+
+                    timestamp, message_text = decrypt_channel_message(ciphertext, cipher_mac, channel_secret)
+
+                    if timestamp is not None and message_text is not None:
+                        result = {
+                            "channel_idx": channel_idx,
+                            "channel_name": channel_info.get("channel_name", f"Channel {channel_idx}"),
+                            "timestamp": timestamp,
+                            "text": message_text,
+                            "decrypted": True,
+                            "path_len": path_len,
+                            "path": path,
+                            "channel_hash": chan_hash_hex,
+                            "path_hash_size": path_hash_size,
+                        }
+                        _LOGGER.debug(
+                            "Decrypted RX_LOG via SDK fields for channel %d: %s",
+                            channel_idx, message_text[:50],
+                        )
+                        break
+
+            return result
+
+        # Fallback: parse from raw payload bytes when SDK pre-parsed fields are absent.
+        # TC_FLOOD (route_type 0) and TC_DIRECT (route_type 3) carry a 4-byte transport
+        # code between the header byte and the path_byte; skip it before reading path info.
+        hex_str = None
+        if isinstance(payload, dict):
+            hex_str = payload.get("payload") or payload.get("raw_hex")
+        elif isinstance(payload, (str, bytes)):
+            hex_str = payload
+
+        if not hex_str:
+            return result
+
+        if isinstance(hex_str, bytes):
+            hex_str = hex_str.hex()
+
+        if isinstance(hex_str, str):
+            packet_bytes = bytes.fromhex(hex_str.replace(" ", "").replace("\n", ""))
+        else:
+            packet_bytes = hex_str
+
+        if len(packet_bytes) < 2:
+            return result
+
+        header = packet_bytes[0]
+        route_type = header & 0x03
+        payload_type = (header >> 2) & 0x0F
+
+        result["header"] = f"{header:02x}"
+        result["payload_type"] = payload_type
+
+        # TC_FLOOD (0) and TC_DIRECT (3) have a 4-byte transport code before the path byte.
+        transport_code_size = 4 if route_type in (0, 3) else 0
+        path_byte_offset = 1 + transport_code_size
+
+        if len(packet_bytes) <= path_byte_offset:
+            return result
+
+        path_byte = packet_bytes[path_byte_offset]
+        path_hash_size = ((path_byte & 0xC0) >> 6) + 1
+        hop_count = path_byte & 0x3F
+
+        result["path_len"] = hop_count
+        result["path_hash_size"] = path_hash_size
+
+        if payload_type != 0x05:
+            _LOGGER.debug(
+                "RX_LOG payload type %02x is not GroupText, skipping decryption",
+                payload_type,
+            )
+            return result
+
+        path_start = path_byte_offset + 1
+        path_end = path_start + hop_count * path_hash_size
+
+        if len(packet_bytes) < path_end + 3:  # Need at least channel_hash + 2-byte MAC
+            return result
+
+        path_data = packet_bytes[path_start:path_end]
+        result["path"] = path_data.hex()
+
+        group_payload = packet_bytes[path_end:]
+        channel_hash_byte = group_payload[0]
+        result["channel_hash"] = f"{channel_hash_byte:02x}"
+
+        if len(group_payload) < 3:
+            return result
+
+        cipher_mac = group_payload[1:3]
+        ciphertext = group_payload[3:]
+
+        for channel_idx, channel_info in channels_info.items():
+            channel_secret = channel_info.get("channel_secret")
+            if not channel_secret:
                 continue
 
-            # Skip GPS data - handled by device_tracker platform
-            if lpp_type in ("gps", GPS_LPP_TYPE):
-                continue
+            if isinstance(channel_secret, str):
+                channel_secret = bytes.fromhex(channel_secret)
 
-            # Create sensors based on the LPP type
-            sensors = self._create_sensors_for_channel(
-                pubkey_prefix, channel, lpp_type, value, node_info
-            )
+            expected_hash_byte = hashlib.sha256(channel_secret).digest()[0]
 
-            for sensor in sensors:
-                # Initialize new sensor with current LPP data (without triggering state update)
-                sensor.update_from_telemetry(lpp_data, update_state=False)
+            if expected_hash_byte == channel_hash_byte:
+                timestamp, message_text = decrypt_channel_message(ciphertext, cipher_mac, channel_secret)
 
-                sensor_key = sensor.get_unique_key()
-                _LOGGER.debug(
-                    f"Sensor: name={sensor.name}, key={sensor_key}, entity_id={sensor.entity_id}"
-                )
-                if sensor_key not in self.discovered_sensors:
-                    self.discovered_sensors[sensor_key] = sensor
-                    sensor.async_on_remove(
-                        partial(self.discovered_sensors.pop, sensor_key, None)
+                if timestamp is not None and message_text is not None:
+                    result = {
+                        "channel_idx": channel_idx,
+                        "channel_name": channel_info.get("channel_name", f"Channel {channel_idx}"),
+                        "timestamp": timestamp,
+                        "text": message_text,
+                        "decrypted": True,
+                        "path_len": hop_count,
+                        "path": path_data.hex(),
+                        "channel_hash": f"{channel_hash_byte:02x}",
+                        "path_hash_size": path_hash_size,
+                    }
+                    _LOGGER.debug(
+                        "Decrypted RX_LOG via raw parse for channel %d: %s",
+                        channel_idx, message_text[:50],
                     )
-                    new_sensors.append(sensor)
-                    _LOGGER.info(
-                        f"Discovered new telemetry sensor: {sensor.name} ({sensor_key})"
-                    )
-                else:
-                    _LOGGER.debug(f"Sensor already discovered: {sensor_key}")
+                    break
 
-        # Add any new sensors to Home Assistant
-        if new_sensors:
-            self.async_add_entities(new_sensors)
+    except Exception as ex:
+        _LOGGER.debug("Error parsing/decrypting RX_LOG: %s", ex)
 
-        # Update all existing sensors for this node (but skip newly discovered ones)
-        for sensor_key, sensor in self.discovered_sensors.items():
-            if sensor_key.startswith(pubkey_prefix) and sensor not in new_sensors:
-                sensor.update_from_telemetry(lpp_data)
+    return result
 
-    def _get_node_info(self, pubkey_prefix: str) -> dict[str, Any]:
-        """Get node information for smart naming."""
-        # Check if this is a tracked repeater
-        repeater_subscriptions = self.coordinator.settings.repeater_records
-        for repeater in repeater_subscriptions:
-            if repeater.get("pubkey_prefix", "").startswith(pubkey_prefix):
-                return {
-                    "name": repeater.get("name"),
-                    "type": "repeater",
-                    "pubkey_prefix": repeater.get("pubkey_prefix"),
-                }
 
-        # Check if this is a tracked client
-        tracked_clients = self.coordinator.settings.client_records
-        for client in tracked_clients:
-            if client.get("pubkey_prefix", "").startswith(pubkey_prefix):
-                return {
-                    "name": client.get("name"),
-                    "type": "client",
-                    "pubkey_prefix": client.get("pubkey_prefix"),
-                }
+def create_message_correlation_key(channel_idx: int, timestamp: int) -> str:
+    """Create a correlation hash key for matching RX_LOG to channel messages.
 
-        # Check if this is the root node
-        coordinator_pubkey = self.coordinator.pubkey or ""
-        if coordinator_pubkey.startswith(pubkey_prefix):
-            return {
-                "name": self.coordinator.name or "Root Node",
-                "type": "root",
-                "pubkey_prefix": coordinator_pubkey,
-            }
+    Uses only channel index and timestamp for correlation. Text is excluded
+    because the HA config name may differ from the on-device advertised name,
+    making text-based matching unreliable.
 
-        # Default to unknown contact
-        contacts = (self.coordinator.data or {}).get("contacts", [])
-        for contact in contacts:
-            contact_pubkey = extract_pubkey_hex(contact)
-            if contact_pubkey.startswith(pubkey_prefix):
-                return {
-                    "name": contact.get("adv_name") or f"Node {pubkey_prefix[:6]}",
-                    "type": "contact",
-                    "pubkey_prefix": contact_pubkey,
-                }
+    Note: Because the timestamp has 1-second granularity, two messages sent on
+    the same channel within the same second will produce the same correlation
+    key. In practice this is unlikely given mesh radio TX times, but it is a
+    known limitation.
 
-        return {
-            "name": f"Unknown Node {pubkey_prefix[:6]}",
-            "type": "unknown",
-            "pubkey_prefix": pubkey_prefix,
-        }
+    Args:
+        channel_idx: Channel index
+        timestamp: Sender's timestamp (unix time)
 
-    def _create_sensors_for_channel(
-        self,
-        pubkey_prefix: str,
-        channel: int,
-        lpp_type: int | str,
-        value: Any,
-        node_info: dict[str, Any],
-    ) -> list[MeshCoreTelemetrySensor]:
-        """Create sensors for a channel, handling multi-value sensors."""
-        # Special handling for client battery on channel 1
-        if node_info.get("type") == "client" and channel == 1 and lpp_type == "voltage":
-            sensors = []
+    Returns:
+        16-character hex string hash
+    """
+    correlation_key = f"{channel_idx}:{timestamp}"
+    hash_key = hashlib.sha256(correlation_key.encode()).hexdigest()[:16]
+    return hash_key
 
-            # Create voltage sensor
-            voltage_description = SensorEntityDescription(
-                key=f"telemetry_{pubkey_prefix}_{channel}_voltage",
-                name=f"Ch{channel} Battery Voltage",
-                icon="mdi:sine-wave",
-                device_class=SensorDeviceClass.VOLTAGE,
-                native_unit_of_measurement="V",
-                state_class=SensorStateClass.MEASUREMENT,
-                suggested_display_precision=2,
-            )
-            voltage_sensor = MeshCoreTelemetrySensor(
-                self.coordinator,
-                voltage_description,
-                pubkey_prefix,
-                channel,
-                lpp_type,
-                node_info,
-            )
-            sensors.append(voltage_sensor)
 
-            # Create battery percentage sensor
-            battery_description = SensorEntityDescription(
-                key=f"telemetry_{pubkey_prefix}_{channel}_battery",
-                name=f"Ch{channel} Battery",
-                icon="mdi:battery",
-                device_class=SensorDeviceClass.BATTERY,
-                native_unit_of_measurement="%",
-                state_class=SensorStateClass.MEASUREMENT,
-                suggested_display_precision=0,
-            )
-            battery_sensor = MeshCoreBatteryPercentageSensor(
-                self.coordinator,
-                battery_description,
-                pubkey_prefix,
-                channel,
-                lpp_type,
-                node_info,
-            )
-            sensors.append(battery_sensor)
+def _normalize_flood_scope_name(name: str) -> str:
+    """Prepend '#' to a region name if not already present."""
+    name = name.strip()
+    if name and not name.startswith("#"):
+        return "#" + name
+    return name
 
-            return sensors
 
-        if lpp_type not in LPP_TYPE_MAPPINGS:
-            if isinstance(lpp_type, str):
-                # Handle string types by creating a generic sensor with the string name
-                type_config = {
-                    "name": lpp_type.replace("_", " ").title(),
-                    "icon": "mdi:gauge",
-                    "create_multi": False,
-                    "state_class": SensorStateClass.MEASUREMENT,
-                }
-            else:
-                _LOGGER.debug(f"Unknown LPP type {lpp_type}, creating generic sensor")
-                type_config = {
-                    "name": f"Sensor Type {lpp_type}",
-                    "icon": "mdi:gauge",
-                    "create_multi": False,
-                }
+# Tokens that denote the global/unscoped wildcard rather than a named
+# region. An unscoped flood already reaches every repeater through the
+# '*' wildcard region they all carry, so the wildcard has no transport
+# key and is never hashed into the inbound keyset. Mirrors the SDK's
+# set_flood_scope disable set ('*', '0', 'None', '') — capital-N "None"
+# only; lowercase "none" is a valid (lowercase-only) region name — plus
+# the parser-specific '#'.
+FLOOD_SCOPE_WILDCARD_TOKENS: Final = ("*", "0", "None", "#", "")
+
+
+def load_flood_scope_keys(scopes_str: str) -> dict[str, bytes]:
+    """Parse a comma-separated flood_scopes string into a name→16-byte-key dict.
+
+    Key derivation mirrors the firmware's auto-key for #hashtag regions:
+    SHA256(scope_name_bytes)[:16].  Names are normalized to have a '#' prefix.
+    The '*' wildcard (and its empty/'0'/'#' equivalents) is the global scope,
+    not a named region — it carries no key and is skipped.
+    """
+    result: dict[str, bytes] = {}
+    if not scopes_str:
+        return result
+    for entry in scopes_str.split(","):
+        raw = entry.strip()
+        # Guard the RAW token BEFORE normalization. _normalize_flood_scope_name
+        # prepends '#', turning a bare '*' into '#*' — which the previous
+        # post-normalize `name not in ("*", "#")` guard failed to catch, so a
+        # junk SHA256('#*') key leaked into the matcher. Guarding the raw token
+        # skips every wildcard form cleanly.
+        if raw in FLOOD_SCOPE_WILDCARD_TOKENS:
+            continue
+        name = _normalize_flood_scope_name(raw)
+        result[name] = hashlib.sha256(name.encode()).digest()[:16]
+    return result
+
+
+def match_flood_scope(
+    transport_code: int,
+    payload_type: int,
+    pkt_payload: bytes,
+    scope_keys: dict[str, bytes],
+) -> str | None:
+    """Return the scope name whose HMAC matches transport_code, or None.
+
+    Mirrors TransportKey::calcTransportCode from the firmware:
+    HMAC-SHA256(scope_key, [payload_type_byte] + pkt_payload)[0:2] as uint16 LE.
+    """
+    if not scope_keys or not pkt_payload:
+        return None
+    check_data = bytes([payload_type]) + pkt_payload
+    for name, key in scope_keys.items():
+        digest = hmac.new(key, check_data, hashlib.sha256).digest()
+        computed = int.from_bytes(digest[:2], "little")
+        if computed == 0:
+            computed = 1
+        elif computed == 0xFFFF:
+            computed = 0xFFFE
+        if computed == transport_code:
+            return name
+    return None
+
+
+def parse_rx_log_data(payload: Any) -> dict[str, Any]:
+    """Parse RX_LOG event payload to extract LoRa packet details.
+
+    Args:
+        payload: Raw event payload (dict with SDK pre-parsed fields, or 'payload'/'raw_hex',
+                 or direct hex string)
+
+    Returns:
+        Dict with parsed fields: header, path_len, path_hash_size, path, path_nodes,
+        channel_hash. Returns empty dict on parsing errors (fault tolerant).
+    """
+    result = {}
+
+    try:
+        if isinstance(payload, dict):
+            # Fast path: use pre-parsed fields set by the SDK's MeshcorePacketParser.
+            # These are always correct for all route types including TC_FLOOD (route_type 0)
+            # and TC_DIRECT (route_type 3) which carry a 4-byte transport code that the
+            # raw-parsing fallback previously handled incorrectly.
+            if "payload_type" in payload:
+                path_len = payload.get("path_len", 0)
+                path_hash_size = payload.get("path_hash_size", 1)
+                path_hex = payload.get("path", "")
+                chan_hash = payload.get("chan_hash")
+
+                header_raw = payload.get("header")
+                if isinstance(header_raw, int):
+                    result["header"] = f"{header_raw:02x}"
+                elif isinstance(header_raw, str):
+                    result["header"] = header_raw
+
+                result["path_len"] = path_len
+                result["path_hash_size"] = path_hash_size
+
+                if path_hex:
+                    result["path"] = path_hex
+                    step = path_hash_size * 2
+                    result["path_nodes"] = [
+                        path_hex[i:i + step]
+                        for i in range(0, len(path_hex), step)
+                        if path_hex[i:i + step]
+                    ]
+
+                if chan_hash:
+                    result["channel_hash"] = chan_hash
+
+                return result
+
+            # Fallback: extract raw hex and parse manually.
+            hex_str = payload.get("payload") or payload.get("raw_hex")
+        elif isinstance(payload, (str, bytes)):
+            hex_str = payload
         else:
-            type_config = LPP_TYPE_MAPPINGS[lpp_type]
+            return result
 
-        sensors = []
+        if not hex_str:
+            _LOGGER.debug("No hex data found in RX_LOG payload")
+            return result
 
-        if type_config.get("create_multi", False) and isinstance(value, (dict, list, tuple)):
-            # Create separate sensors for multi-value types
-            multi_fields = type_config.get("multi_fields", [])
+        if isinstance(hex_str, bytes):
+            hex_str = hex_str.hex()
 
-            for field_info in multi_fields:
-                if isinstance(field_info, dict):
-                    # Complex field definition
-                    field = field_info["field"]
-                    field_index = field_info.get("index")
-                    field_name = field_info["name"]
-                    field_icon = field_info.get("icon", type_config["icon"])
-                    field_unit = field_info.get(
-                        "unit", type_config.get("native_unit_of_measurement")
-                    )
-                    field_precision = field_info.get(
-                        "precision", type_config.get("suggested_display_precision")
-                    )
-                else:
-                    # Simple field name (like accelerometer x/y/z)
-                    field = field_info
-                    field_index = None
-                    field_name = f"{type_config['name']} {field.upper()}"
-                    field_icon = type_config["icon"]
-                    field_unit = type_config.get("native_unit_of_measurement")
-                    field_precision = type_config.get("suggested_display_precision")
+        hex_str = str(hex_str).lower().replace(" ", "").replace("\n", "").replace("\r", "")
 
-                present = (
-                    field in value
-                    if isinstance(value, dict)
-                    else field_index is not None and field_index < len(value)
-                )
-                if present:
-                    description = SensorEntityDescription(
-                        key=f"telemetry_{pubkey_prefix}_{channel}_{lpp_type}_{field}",
-                        name=f"Ch{channel} {field_name}",
-                        icon=field_icon,
-                        device_class=type_config.get("device_class"),
-                        native_unit_of_measurement=field_unit,
-                        state_class=type_config.get("state_class"),
-                        suggested_display_precision=field_precision,
-                    )
+        if len(hex_str) < 4:
+            _LOGGER.debug("RX_LOG hex too short: %d chars", len(hex_str))
+            return result
 
-                    sensor = MeshCoreTelemetrySensor(
-                        self.coordinator,
-                        description,
-                        pubkey_prefix,
-                        channel,
-                        lpp_type,
-                        node_info,
-                        field,
-                        field_index,
-                    )
-                    sensors.append(sensor)
-        else:
-            # Single sensor for simple types
-            description = SensorEntityDescription(
-                key=f"telemetry_{pubkey_prefix}_{channel}_{lpp_type}",
-                name=f"Ch{channel} {type_config['name']}",
-                icon=type_config.get("icon", "mdi:gauge"),
-                device_class=type_config.get("device_class"),
-                native_unit_of_measurement=type_config.get(
-                    "native_unit_of_measurement"
-                ),
-                suggested_unit_of_measurement=type_config.get(
-                    "suggested_unit_of_measurement"
-                ),
-                state_class=type_config.get("state_class"),
-                suggested_display_precision=type_config.get(
-                    "suggested_display_precision"
-                ),
+        result["header"] = hex_str[0:2]
+
+        header = int(hex_str[0:2], 16)
+        route_type = header & 0x03
+
+        # TC_FLOOD (0) and TC_DIRECT (3) have a 4-byte transport code before the path byte;
+        # skip it (8 hex chars) before reading path info.
+        transport_nibbles = 8 if route_type in (0, 3) else 0
+        path_byte_start = 2 + transport_nibbles
+
+        if len(hex_str) < path_byte_start + 2:
+            return result
+
+        try:
+            path_byte = int(hex_str[path_byte_start:path_byte_start + 2], 16)
+        except ValueError:
+            _LOGGER.debug(
+                "Could not parse path byte from: %s",
+                hex_str[path_byte_start:path_byte_start + 2],
             )
+            return result
 
-            sensor = MeshCoreTelemetrySensor(
-                self.coordinator,
-                description,
-                pubkey_prefix,
-                channel,
-                lpp_type,
-                node_info,
+        path_hash_size = ((path_byte & 0xC0) >> 6) + 1
+        hop_count = path_byte & 0x3F
+        result["path_len"] = hop_count
+        result["path_hash_size"] = path_hash_size
+
+        path_start = path_byte_start + 2
+        path_end = path_start + hop_count * path_hash_size * 2
+
+        if len(hex_str) < path_end:
+            _LOGGER.debug(
+                "RX_LOG hex too short for path data: expected at least %d, got %d",
+                path_end,
+                len(hex_str),
             )
-            sensors.append(sensor)
+            return result
 
-        return sensors
+        path_hex = hex_str[path_start:path_end]
+        result["path"] = path_hex
 
+        step = path_hash_size * 2
+        result["path_nodes"] = [path_hex[i:i + step] for i in range(0, len(path_hex), step)]
 
-class MeshCoreTelemetrySensor(CoordinatorEntity, SensorEntity):
-    """Sensor for telemetry data from mesh nodes."""
+        if len(hex_str) >= path_end + 2:
+            result["channel_hash"] = hex_str[path_end:path_end + 2]
 
-    def __init__(
-        self,
-        coordinator: MeshCoreDataUpdateCoordinator,
-        description: SensorEntityDescription,
-        pubkey_prefix: str,
-        channel: int,
-        lpp_type: int | str,
-        node_info: dict[str, Any],
-        field: str = None,  # type: ignore
-        field_index: int | None = None,
-    ) -> None:
-        """Initialize the telemetry sensor."""
-        super().__init__(coordinator)
-        self.entity_description = description
-        self.pubkey_prefix = pubkey_prefix
-        self.channel = channel
-        self.lpp_type = lpp_type
-        self.node_info = node_info
-        self.field = field  # For multi-value sensors
-        self.field_index = field_index  # Position for unnamed multi-value fields
-
-        # Set up naming based on node type
-        node_name = node_info.get("name", f"Node {pubkey_prefix[:6]}")
-        node_type = node_info.get("type", "unknown")
-        full_pubkey = node_info.get("pubkey_prefix", pubkey_prefix)
-
-        # Build unique ID and entity ID using consistent format
-        field_suffix = f"_{field}" if field else ""
-        self._attr_unique_id = f"{coordinator.config_entry.entry_id}_{pubkey_prefix}_{channel}_{lpp_type}{field_suffix}_telemetry"
-
-        # Smart entity naming - consistent with existing sensors
-        # Remove channel prefix from the name (case-insensitive)
-        sensor_name_lower = description.name.lower().replace(" ", "_")
-        channel_prefix = f"ch{channel}_"
-        if sensor_name_lower.startswith(channel_prefix):
-            sensor_type_name = sensor_name_lower[len(channel_prefix) :]
-        else:
-            sensor_type_name = sensor_name_lower
-
-        if node_type == "root":
-            # For root node, use cleaner entity IDs
-            device_name = full_pubkey[:6]
-            entity_key = f"{sensor_type_name}_ch{channel}"
-            self.entity_id = format_entity_id("sensor", device_name, entity_key, sanitize_name(node_name))
-        else:
-            # For other nodes, include more details
-            device_name = pubkey_prefix[:10]
-            entity_key = f"ch{channel}_{sensor_type_name}"
-            suffix = sanitize_name(node_name)
-            self.entity_id = format_entity_id("sensor", device_name, entity_key, suffix)
-
-        # Set display name
-        self._attr_name = description.name
-
-        # Set device info using common utilities
-        device_id = build_device_id(
-            coordinator.config_entry.entry_id, full_pubkey, node_type
-        )
-        device_name = build_device_name(node_name, full_pubkey, node_type)
-        device_model = get_device_model(node_type)
-
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, device_id)},
-            name=device_name,
-            manufacturer="MeshCore",
-            model=device_model,
-            **(
-                via_companion(coordinator.hass, coordinator.config_entry.entry_id)
-                if node_type != "root"
-                else {}
-            ),
+        _LOGGER.debug(
+            "Parsed RX_LOG: header=%s, path_len=%d, path=%s, channel_hash=%s",
+            result.get("header"),
+            result.get("path_len"),
+            result.get("path"),
+            result.get("channel_hash"),
         )
 
-        # Store sensor value - will be populated by update_from_telemetry
-        self._native_value = None
-        self._last_updated = None
-        self._raw_value = None
+    except Exception as ex:
+        _LOGGER.debug("Error parsing RX_LOG data: %s", ex)
 
-    def get_unique_key(self) -> str:
-        """Get unique key for this sensor."""
-        field_suffix = f"_{self.field}" if self.field else ""
-        return f"{self.pubkey_prefix}_{self.channel}_{self.lpp_type}{field_suffix}"
-
-    def update_from_telemetry(self, lpp_data: list, update_state: bool = True):
-        """Update sensor value from telemetry data."""
-        for channel_data in lpp_data:
-            if (
-                channel_data.get("channel") == self.channel
-                and channel_data.get("type") == self.lpp_type
-            ):
-
-                value = channel_data.get("value")
-                self._raw_value = value
-                self._last_updated = time.time()
-                self._native_value = lpp_field_value(
-                    value, self.field, self.field_index
-                )
-
-                # Update Home Assistant state only if requested
-                if update_state:
-                    self.async_write_ha_state()
-                break
-
-    @property
-    def native_value(self) -> Any:
-        """Return the sensor value."""
-        return self._native_value
-
-    @property
-    def available(self) -> bool:
-        """Return if the sensor is available."""
-        if self._last_updated is None:
-            return False
-        # Use dynamic timeout based on configured update interval
-        update_interval = self.coordinator.get_device_update_interval(self.pubkey_prefix)
-        timeout = update_interval * SENSOR_AVAILABILITY_TIMEOUT_MULTIPLIER
-        return time.time() - self._last_updated < timeout
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        """Return additional state attributes."""
-        attributes = {
-            "channel": self.channel,
-            "lpp_type": self.lpp_type,
-            "pubkey_prefix": self.pubkey_prefix,
-            "node_type": self.node_info.get("type"),
-            "node_name": self.node_info.get("name"),
-        }
-
-        if self.field:
-            attributes["field"] = self.field
-
-        if self._last_updated:
-            attributes["last_updated"] = datetime.fromtimestamp(
-                self._last_updated
-            ).isoformat()
-
-        if self._raw_value is not None:
-            attributes["raw_value"] = self._raw_value
-
-        return attributes
+    return result
 
 
-class MeshCoreBatteryPercentageSensor(MeshCoreTelemetrySensor):
-    """Battery percentage sensor that converts voltage to percentage."""
+_REPORTED_DEPRECATIONS: set[str] = set()
 
-    def __init__(self, *args, **kwargs):
-        """Initialize the battery percentage sensor."""
-        super().__init__(*args, **kwargs)
-        # Override the unique_id to use "battery" instead of "voltage"
-        self._attr_unique_id = f"{self.coordinator.config_entry.entry_id}_{self.pubkey_prefix}_{self.channel}_battery_telemetry"
 
-    def get_unique_key(self) -> str:
-        """Get unique key for battery percentage sensor."""
-        # Use a different suffix to distinguish from voltage sensor
-        return f"{self.pubkey_prefix}_{self.channel}_battery"
+def warn_deprecated_internal(name: str, advice: str) -> None:
+    """Log once per name when another integration touches a removed internal.
 
-    def update_from_telemetry(self, lpp_data: list, update_state: bool = True) -> None:
-        """Update sensor value from telemetry data, converting voltage to percentage."""
-        for channel_data in lpp_data:
-            if (
-                channel_data.get("channel") == self.channel
-                and channel_data.get("type") == self.lpp_type
-            ):
+    Companion integrations reached into the 2.x coordinator directly. 3.0 keeps
+    a few of those names alive so they don't break on upgrade, and names the
+    caller so users know which integration needs updating.
+    """
+    if name in _REPORTED_DEPRECATIONS:
+        return
+    _REPORTED_DEPRECATIONS.add(name)
+    caller = "unknown caller"
+    frame = sys._getframe(1)
+    while frame is not None:
+        path = frame.f_code.co_filename.replace("\\", "/")
+        if "custom_components/" in path and f"/{DOMAIN}/" not in path:
+            caller = f"{path.split('custom_components/', 1)[1]}:{frame.f_lineno}"
+            break
+        frame = frame.f_back
+    _LOGGER.warning(
+        "%s is a removed meshcore internal, called from %s. It still works in 3.0 "
+        "but will be deleted in a future release; %s",
+        name,
+        caller,
+        advice,
+    )
 
-                voltage = channel_data.get("value")
-                if voltage is not None:
-                    self._raw_value = voltage
-                    self._last_updated = time.time()
 
-                    # Convert voltage to battery percentage
-                    voltage_mv = int(voltage * 1000)
-                    self._native_value = calculate_battery_percentage(voltage_mv)
+LORA_PREAMBLE_SYMBOLS: Final = 16  # MeshCore sets this on every radio
 
-                    # Update Home Assistant state only if requested
-                    if update_state:
-                        self.async_write_ha_state()
-                break
 
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        """Return additional state attributes including the raw voltage."""
-        attributes = super().extra_state_attributes
-        if self._raw_value is not None:
-            attributes["voltage"] = round(self._raw_value, 3)
-        return attributes
+def lora_airtime(payload_len: int, sf: int, bw_khz: float, cr: int) -> float:
+    """Return the seconds a LoRa packet spends on air (Semtech AN1200.13).
+
+    ``cr`` is the coding-rate denominator the node reports, 5-8 for 4/5-4/8.
+    Explicit header and CRC, as MeshCore sends them.
+    """
+    symbol = (2**sf) / (bw_khz * 1000)
+    low_data_rate = 1 if symbol > 0.016 else 0
+    bits = 8 * payload_len - 4 * sf + 28 + 16
+    payload_symbols = 8 + max(math.ceil(bits / (4 * (sf - 2 * low_data_rate))) * cr, 0)
+    return (LORA_PREAMBLE_SYMBOLS + 4.25 + payload_symbols) * symbol
